@@ -1,221 +1,248 @@
 #include <IRremote.hpp>
 
 #include <EEPROM.h>
-#include <Ds1302.h>
+#include <DS1302.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Bonezegei_DHT11.h>
 #include <Adafruit_Sensor.h>  // include Adafruit sensor library
 #include <Adafruit_BMP280.h>
+#include <SPI.h>
 
-#define BMP_CS 10
-
-//Adafruit_BMP280 bmp(BMP_CS); // hardware SPI
 
 #define IR_RECEIVE_PIN 2
-enum DisplayMode {
-  DISPLAY_MODE_TIME_DATE,    //0
-  DISPLAY_MODE_TEMPERATURE,  //1
-  DISPLAY_MODE_HUMIDITY,     //2
-  DISPLAY_MODE_PRESSURE,     //3
-  DISPLAY_MODE_ALTITUDE,     //4
-};
+#define BMP_SCK   13
+#define BMP_MISO  12
+#define BMP_MOSI  11
+#define BMP_CS    10
+#define BMP280_ADDRESS 0x77
 
-enum TempMode {
-  TEMP_CELCIUS,
-  TEMP_FAHRENHEIT
-};
 
-enum DateTimeMode {
-  DATE_TIME,
-  DATE,
-  TIME
-};
+enum DisplayMode{DISPLAY_MODE_TIME_DATE, DISPLAY_MODE_TEMPERATURE, DISPLAY_MODE_HUMIDITY, DISPLAY_MODE_PRESSURE, DISPLAY_MODE_ALTITUDE};
 
-struct Memory {
+enum TempMode{TEMP_CELCIUS, TEMP_FAHRENHEIT};
+
+enum DateTimeMode{DATE_TIME, DATE,TIME};
+
+enum PressureMode{HPA, MMHG};
+
+struct Memory{
   DisplayMode field1;
   TempMode field2;
   DateTimeMode field3;
+  PressureMode field4;
 };
 
 Bonezegei_DHT11 dht(A0);
-LiquidCrystal_I2C lcd(0x20, 16, 2);
-Adafruit_BMP280 bmp280(BMP_CS);
-Ds1302 rtc(5, 3, 4);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Adafruit_BMP280 bmp(BMP_CS);
 
-int number[11] = { 15, 82, 80, 16, 86, 84, 20, 78, 76, 12, 15 };
+DS1302 rtc(3, 4, 5);
 
-int firstRowType = DISPLAY_MODE_TIME_DATE;
-int tempType = TEMP_CELCIUS;
-int DateTimeType = DATE_TIME;
-bool scrollDirection = true;  
-bool isPaused = false;        
-int eeAddress = 0;
-bool isCalculatorMode = false;
+const uint8_t number[11] = {15,82,80,16,86,84,20,78,76,12,15};
+// Періоди оновлення
+const unsigned int SENSOR_UPDATE_INTERVAL = 5000;  // Інтервал зчитування датчиків (мс)
+const unsigned int DISPLAY_UPDATE_INTERVAL = 1000; // Інтервал оновлення дисплея (мс)
 
-int calculatorValue = 0;     
-String calculatorInput = ""; 
-char lastOperation = '\0';   
-int offset = 0;
+// Глобальні змінні для асинхронності
+unsigned long lastSensorUpdate = 0;
+unsigned long lastDisplayUpdate = 0;
+
+// Дані датчиків
+float currentTemp = 0.0;
+float currentHumidity = 0.0;
+float currentPressure = 0.0;
+float currentAltitude = 0.0;
+
+// Стани
+uint8_t firstRowType = DISPLAY_MODE_TIME_DATE; // Тип змінної на першому рядку
+uint8_t tempType = TEMP_CELCIUS;
+uint8_t DateTimeType = DATE_TIME;
+uint8_t pressureType = HPA;
+bool scrollDirectionCalc = true; // true - вперед, false - назад
+bool scrollDirectionFirst = true; // true - вперед, false - назад
+bool scrollDirectionSecond = true; // true - вперед, false - назад
+
+bool isPaused = false; // Пауза оновлення даних
+int eeAddress = 0;   //Location we want the data to be put.
+
+bool isCalculatorMode = false; // Режим калькулятора
+String calculatorInput = ""; // Поточне введення
+
+int offsetCalc = 0;
+int offsetFirstRow = 0;
+int offsetSecondRow = 0;
 
 void setup() {
+  // put your setup code here, to run once:
   Serial.begin(9600);
+  // Get data from memory
   while (!Serial) {
-    ;  // wait for serial port to connect. Needed for native USB port only
+    ; // wait for serial port to connect. Needed for native USB port only
   }
   Memory obj;
-  delay(10);
   EEPROM.get(eeAddress, obj);
-  Serial.println(sizeof(Memory));
-  firstRowType = obj.field1; 
+  firstRowType = obj.field1; // Тип змінної на першому рядку
   tempType = obj.field2;
   DateTimeType = obj.field3;
+  pressureType = obj.field4;
 
-  if (!bmp280.begin()) {
-
+  if (!bmp.begin())
+  {  
     Serial.println("Could not find a valid BMP280 sensor, check wiring!");
-    while (1)
-      ;
+    delay(200);
   }
+
   lcd.init();
   lcd.backlight();
-  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+  
   dht.begin();
 
-  rtc.init();
+  updateSensors();
 
-  // test if clock is halted and set a date-time (see example 2) to start it
-  if (rtc.isHalted()) {
-    Serial.println("RTC is halted. Setting time...");
-
-    Ds1302::DateTime dt = {
-      .year = 24,
-      .month = Ds1302::MONTH_NOV,
-      .day = 25,
-      .hour = 22,
-      .minute = 27,
-      .second = 42,
-      .dow = Ds1302::DOW_TUE
-    };
-    rtc.setDateTime(&dt);
-  }
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
 }
 
 void loop() {
+
+  // Асинхронне оновлення даних датчиків
+  if (!isPaused && !isCalculatorMode && millis() - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
+    lastSensorUpdate = millis();
+    updateSensors();
+  }
+
+  // Асинхронне оновлення дисплея
+  if (!isPaused && !isCalculatorMode && millis() - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
+    lastDisplayUpdate = millis();
+    updateLCD();
+  }
+
   if (IrReceiver.decode()) {
     remoteControl();
     delay(100);
     IrReceiver.resume();
   }
+}
 
-  if (!isPaused && !isCalculatorMode) {
-    updateLCD();
-  }
+void updateSensors() {
+  dht.getData();
+  currentTemp = dht.getTemperature();
+  currentHumidity = dht.getHumidity();
+  currentPressure = bmp.readPressure();
+  currentAltitude = bmp.readAltitude(1024.0); // Налаштуйте для вашого тиску на рівні моря
 }
 
 void updateLCD() {
-  delay(300);
   lcd.clear();
 
-  Ds1302::DateTime now;
-  rtc.getDateTime(&now);
-
-  dht.getData();
-  String date = String(now.day) + "/" + String(now.month) + "/" + String(now.year + 2000);
-  String time = (now.hour < 10 ? "0" : "") + String(now.hour) + ":" + (now.minute < 10 ? "0" : "") + String(now.minute) + ":" + (now.second < 10 ? "0" : "") + String(now.second);
-
+  // Форматуємо дату та час у вигляді рядка
+  String date = rtc.getDateStr();
+  String time = rtc.getTimeStr();
+  // Вибір формату відображення (дата, час або разом)
   String dateTime;
   if (DateTimeType == DATE_TIME) {
     dateTime = date + " " + time;
-
   } else if (DateTimeType == DATE) {
     dateTime = date;
-
-  } else {  
+  } else { // TIME
     dateTime = time;
   }
-
-  float temp = dht.getTemperature();
-  char type = 'C';
-
-  if (tempType != TEMP_CELCIUS) {
-    temp = (temp * 9) / 5 + 32;
-    type = 'F';
-
-  } else {
-    type = 'C';
+  
+  char type_temp = 'C';
+  float Temp = currentTemp;
+  if(tempType != TEMP_CELCIUS){
+    Temp = (currentTemp *9)/5 + 32;
+    type_temp = 'F';
   }
 
-  float humidity = dht.getHumidity();
-  float pressure = bmp280.readPressure();
-  float altitude = bmp280.readAltitude(1024);
-
+  String type_pressure = "hPA";
+  float pressure = currentPressure/100;
+  if(pressureType != HPA){
+    pressure = currentPressure * 0.7500615;
+    type_pressure = "mmHg";
+  }
+  
+  // Перший рядок
   String firstRowText = "";
   switch (firstRowType) {
     case DISPLAY_MODE_TIME_DATE:
       firstRowText = dateTime;
       break;
     case DISPLAY_MODE_TEMPERATURE:
-      firstRowText = "Temp: " + String(temp) + (char)223 + type;
+      firstRowText = "Temp: " + String(Temp) + (char)223 + type_temp;
       break;
     case DISPLAY_MODE_HUMIDITY:
-      firstRowText = "Humidity: " + String(humidity) + "%";
+      firstRowText = "Humidity: " + String(currentHumidity) + "%";
       break;
     case DISPLAY_MODE_PRESSURE:
-      firstRowText = "Pressure: " + String(pressure) + "hPA";
+      firstRowText = "Pressure: " + String(pressure) + type_pressure;
       break;
     case DISPLAY_MODE_ALTITUDE:
-      firstRowText = "Altitude: " + String(altitude) + "m";
+      firstRowText = "Altitude: " + String(currentAltitude) + "m";
       break;
   }
 
+  // Другий рядок 
   String secondRowText = "";
   switch ((firstRowType + 1) % 5) {
     case DISPLAY_MODE_TIME_DATE:
-      secondRowText = dateTime.substring(offset, 16 + offset);
+      secondRowText = dateTime;
       break;
     case DISPLAY_MODE_TEMPERATURE:
-      secondRowText = "Temp: " + String(temp) + (char)223 + type;
+      secondRowText = "Temp: " + String(Temp) + (char)223 + type_temp;
       break;
     case DISPLAY_MODE_HUMIDITY:
-      secondRowText = "Humidity: " + String(humidity) + "%";
+      secondRowText = "Humidity: " + String(currentHumidity) + "%";
       break;
     case DISPLAY_MODE_PRESSURE:
-      String pressureText = "Pressure: " + String(pressure, 2) + "hPA";
-      secondRowText = pressureText.substring(offset, offset + 16);
+      secondRowText = "Pressure: " + String(pressure) + type_pressure;
       break;
     case DISPLAY_MODE_ALTITUDE:
-      secondRowText = "Altitude: " + String(altitude, 2) + "m";
+      secondRowText = "Altitude: " + String(currentAltitude) + "m";
       break;
   }
 
+  handleScrolling(firstRowText.length(), secondRowText.length());
   lcd.setCursor(0, 0);
-  lcd.print(firstRowText.substring(offset, offset + 16));
+  lcd.print(firstRowText.substring(offsetFirstRow, offsetFirstRow + 16));
   lcd.setCursor(0, 1);
-  lcd.print(secondRowText);
-  handleScrolling(firstRowText.length());
+  lcd.print(secondRowText.substring(offsetSecondRow, offsetSecondRow + 16));
+  
 }
 
-void handleScrolling(int n) {
-  if (n <= 16) {
-    offset = 0;  
-    return;
+void handleScrolling(int firstRowLength, int secondRowLength) {
+  // Прокрутка першого рядка
+  if (firstRowLength > 16) {
+    if (scrollDirectionFirst) {
+      offsetFirstRow++;
+      if (offsetFirstRow >= firstRowLength - 16) {
+        scrollDirectionFirst = false;
+      }
+    } else {
+      offsetFirstRow--;
+      if (offsetFirstRow <= 0) {
+        scrollDirectionFirst = true;
+      }
+    }
+  } else {
+    offsetFirstRow = 0;  // Скидаємо зсув, якщо текст короткий
   }
 
-  if (scrollDirection) {
-    offset++;
-    if (offset >= n - 16) {     
-      scrollDirection = false; 
-      offset = n - 16;
+  // Прокрутка другого рядка
+  if (secondRowLength > 16) {
+    if (scrollDirectionSecond) {
+      offsetSecondRow++;
+      if (offsetSecondRow >= secondRowLength - 16) {
+        scrollDirectionSecond = false;
+      }
+    } else {
+      offsetSecondRow--;
+      if (offsetSecondRow <= 0) {
+        scrollDirectionSecond = true;
+      }
     }
-
-  }
-  else {
-    offset--;
-    if (offset <= 0) {         
-      scrollDirection = true;  
-      offset = 0;
-    }
+  } else {
+    offsetSecondRow = 0;  // Скидаємо зсув, якщо текст короткий
   }
 }
 
@@ -229,93 +256,106 @@ void remoteControl() {
   }
 
   switch (command) {
-    case 6:  // UP
-      if (firstRowType - 1 < 0)
+    case 22: // UP
+        firstRowType = (firstRowType + 1) % 5;
+      break;
+
+    case 6: // DOWN
+      if(firstRowType - 1 < 0)
         firstRowType = 4;
-      else firstRowType = (firstRowType - 1) % 5;
+      else
+        firstRowType = (firstRowType - 1) % 5;
       break;
 
-    case 22:  // DOWN
-      firstRowType = (firstRowType + 1) % 5;
-      break;
-
-    case 27:  // LEFT
-      if (firstRowType == DISPLAY_MODE_TIME_DATE)
+    case 27: // LEFT
+      if(firstRowType == DISPLAY_MODE_TIME_DATE)
         DateTimeType = (DateTimeType - 1 + 3) % 3;
-      else if (firstRowType == DISPLAY_MODE_TEMPERATURE)
+      else if(firstRowType == DISPLAY_MODE_TEMPERATURE)
         tempType = (tempType - 1 + 2) % 2;
+      else if(firstRowType == DISPLAY_MODE_PRESSURE)
+        pressureType = (pressureType - 1 +2) %2;
       break;
 
-    case 90:  // RIGHT
-      if (firstRowType == DISPLAY_MODE_TIME_DATE)
+    case 90: // RIGHT
+      if(firstRowType == DISPLAY_MODE_TIME_DATE)
         DateTimeType = (DateTimeType + 1) % 3;
-      else if (firstRowType == DISPLAY_MODE_TEMPERATURE)
+      else if(firstRowType == DISPLAY_MODE_TEMPERATURE)
         tempType = (tempType + 1) % 2;
+       else if(firstRowType == DISPLAY_MODE_PRESSURE)
+        pressureType = (pressureType + 1) %2;
       break;
 
-    case 26:  // STOP
+    case 26: // STOP
       isPaused = !isPaused;
       break;
-    case 69:  // MENU
+    case 69: // MENU
       isCalculatorMode = true;
       calculatorInput = "";
-      lastOperation = '\0';
-      calculatorValue = 0;
-
+      
       int value;
       eeAddress += sizeof(Memory);
       EEPROM.get(eeAddress, value);
+      eeAddress = 0;
 
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("Calc Mode: " + String(value));
+      lcd.print("Calc Mode: "+String(value));
       lcd.setCursor(0, 1);
       lcd.blink_on();
-      offset = 0;
+      offsetCalc=0;
       break;
     default:
       Serial.println("UNDEFINED");
   }
 }
 
-void handleCalculatorInput(uint16_t command) {
-
+void handleCalculatorInput(uint16_t command) {  
+  // Введення чисел та операцій
   for (int i = 0; i <= 10; i++) {
-    if (command == number[i]) {     
-      calculatorInput += String(i);  
+    if (command == number[i]) { // Якщо команда є цифрою
+      calculatorInput += String(i); // Додаємо цифру до введення
       break;
     }
   }
 
-  if (command == 17) {
-    if (!(calculatorInput == NULL) && (calculatorInput[calculatorInput.length() - 1] != '+' && calculatorInput[calculatorInput.length() - 1] != '-')) {
-      calculatorInput += "+";  
+  // Додавання оператора "+" до введення
+  if (command == 17) { 
+    if (!(calculatorInput==NULL) && 
+        (calculatorInput[calculatorInput.length() - 1] != '+' && 
+         calculatorInput[calculatorInput.length() - 1] != '-')) {
+      calculatorInput += "+"; // Додаємо оператор
     }
   }
 
-  if (command == 81) {
-    if (!(calculatorInput == NULL) && (calculatorInput[calculatorInput.length() - 1] != '+' && calculatorInput[calculatorInput.length() - 1] != '-')) {
-      calculatorInput += "-";  
+  // Додавання оператора "-" до введення
+  if (command == 81) { 
+    if (!(calculatorInput == NULL) && 
+        (calculatorInput[calculatorInput.length() - 1] != '+' && 
+         calculatorInput[calculatorInput.length() - 1] != '-')) {
+      calculatorInput += "-"; // Додаємо оператор
     }
   }
 
-  if (command == 69) {
+  // Операція EXIT
+  if (command == 69) { 
     isCalculatorMode = false;
     lcd.clear();
     lcd.blink_off();
     return;
   }
 
-  if (command == 5) {
-    int result = executeLastOperation(calculatorInput); 
+
+  // Обчислення результату "="
+  if (command == 5) { 
+    int result = executeLastOperation(calculatorInput); // Викликаємо обчислення
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Result: ");
     lcd.setCursor(0, 1);
     lcd.print(result);
-    calculatorValue = result; 
-    calculatorInput = "";
-    offset = 0;
+
+    calculatorInput = "";     // Очищаємо введення
+    offsetCalc=0;
     Memory obj = {
       firstRowType,
       tempType,
@@ -332,58 +372,58 @@ void handleCalculatorInput(uint16_t command) {
 
   calculatorScroll(calculatorInput.length());
   lcd.setCursor(0, 1);
-  lcd.print(calculatorInput.substring(offset, offset + 16));
+  lcd.print(calculatorInput.substring(offsetCalc, offsetCalc+16));
+
 }
 
-void calculatorScroll(int n) {
-  if (n > 16) {
-    if (offset < n - 16) {
-      offset++;
-
-    } else {
-      offset = 0;
+void calculatorScroll(int n){
+  if(n > 16){
+    if (offsetCalc < n-16){
+      offsetCalc++;
     }
-
-  } else {
-    offset = 0;
+    else{
+      offsetCalc = 0;
+    }
+  }
+  else {
+    offsetCalc =0;
   }
 }
 
 int executeLastOperation(const String &input) {
-  int total = 0;
-  String currentNumber = "";  
-  char lastOperator = '+';
+  int total = 0;            // Підсумкове значення
+  String currentNumber = ""; // Поточне число
+  char lastOperator = '+';  // Останній оператор
 
   for (int i = 0; i < input.length(); i++) {
     char c = input[i];
 
-    if (isdigit(c)) {      
-      currentNumber += c; 
-
-    } else if (c == '+' || c == '-') {
+    if (isdigit(c)) { // Якщо це цифра
+      currentNumber += c; // Додаємо до поточного числа
+    } else if (c == '+' || c == '-') { // Якщо це оператор
       if (!(currentNumber == NULL)) {
-        int number = currentNumber.toInt(); 
+        int number = currentNumber.toInt(); // Перетворюємо число
         if (lastOperator == '+') {
-          total += number; 
-
+          total += number; // Додаємо до загального
         } else if (lastOperator == '-') {
-          total -= number;  
+          total -= number; // Віднімаємо від загального
         }
-        currentNumber = "";
+        currentNumber = "";   // Скидаємо поточне число
       }
-      lastOperator = c;  
+      lastOperator = c; // Оновлюємо останній оператор
     }
   }
 
+  // Обробляємо останнє число
   if (!(currentNumber == NULL)) {
     int number = currentNumber.toInt();
     if (lastOperator == '+') {
       total += number;
-
     } else if (lastOperator == '-') {
       total -= number;
     }
   }
 
-  return total;  
+  return total; // Повертаємо результат
 }
+// end of code.
